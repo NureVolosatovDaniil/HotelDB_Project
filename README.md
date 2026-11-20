@@ -1,20 +1,24 @@
-# HotelDB - Lab 3
-
+# HotelDB
 ## Technologies
 
-- Node.js, Express, JavaScript
-- Microsoft SQL Server (`mssql`, `msnodesqlv8`)
-- Windows Authentication
+- Backend: Node.js, Express, JavaScript, mssql / msnodesqlv8
+- Database: SQL Server with Windows Authentication
+- Frontend: React, Vite, plain CSS
 
-## Setup
+## Setup and startup
 
-Requires Node.js 22+, SQL Server Express, and Microsoft ODBC Driver 17 or 18.
+Requires Node.js 22.12+, SQL Server Express and Microsoft ODBC Driver 17
 
+Backend:
 ```powershell
 cd backend
 npm ci
-Copy-Item .env.example .env
 npm start
 ```
 
-Configure `.env` with your local SQL Server connection settings. The API runs at `http://127.0.0.1:3000`.
+Frontend:
+```powershell
+cd frontend
+npm ci
+npm run dev
+```

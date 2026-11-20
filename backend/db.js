@@ -20,9 +20,6 @@ function boolean(name, fallback) {
 const settings = {
   server: required('DB_SERVER'),
   database: required('DB_DATABASE'),
-  enableTestWrites: boolean('DB_ENABLE_TEST_WRITES', false),
-  testDatabase: process.env.DB_CONFIRMED_TEST_DATABASE || '',
-  testServer: process.env.DB_CONFIRMED_TEST_SERVER || '',
 };
 
 const odbcValue = value => '{' + String(value).replaceAll('}', '}}') + '}';

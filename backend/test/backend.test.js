@@ -1,21 +1,20 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const { once } = require('node:events');
-// Any attempted DB call fails this test; original HotelDB must not receive writes.
 const db = require('../db');
-db.settings.enableTestWrites = false;
+
 let databaseCalls = 0;
 db.getPool = async () => { databaseCalls++; throw new Error('Unexpected database call'); };
 const app = require('../app');
 const { errorHandler } = require('../errors');
 
-test('invalid inputs and both write gates reject without connecting to SQL', async () => {
+test('invalid read and CRUD inputs are rejected without connecting to SQL', async () => {
   const server = app.listen(0, '127.0.0.1');
   await once(server, 'listening');
   try {
     const base = 'http://127.0.0.1:' + server.address().port;
     for (const route of ['/api/rooms/0', '/api/rooms/2147483648',
-      '/api/rooms/max-booking', '/api/rooms/max-booking?roomNumber=12345678901',
+      '/api/rooms/booking-count', '/api/rooms/max-booking', '/api/rooms/max-booking?roomNumber=12345678901',
       '/api/rooms/cheaper-than?maxPrice=-1', '/api/rooms/cheaper-than?maxPrice=Infinity',
       '/api/rooms/cheaper-than?maxPrice=1&maxPrice=2']) {
       const response = await fetch(base + route);
@@ -23,12 +22,13 @@ test('invalid inputs and both write gates reject without connecting to SQL', asy
       assert.equal((await response.json()).error.code, 'INVALID_INPUT');
     }
 
-    for (const route of ['/api/bookings', '/api/staff/cleanup']) {
+    for (const route of ['/api/rooms', '/api/bookings', '/api/staff', '/api/staff/cleanup']) {
       const response = await fetch(base + route, { method: 'POST',
         headers: { 'Content-Type': 'application/json' }, body: '{}' });
-      assert.equal(response.status, 403);
-      assert.equal((await response.json()).error.code, 'WRITES_DISABLED');
+      assert.equal(response.status, 400);
+      assert.equal((await response.json()).error.code, 'INVALID_INPUT');
     }
+
 
     const badJson = await fetch(base + '/api/bookings', { method: 'POST',
       headers: { 'Content-Type': 'application/json' }, body: '{' });

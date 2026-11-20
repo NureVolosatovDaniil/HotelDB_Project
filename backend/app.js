@@ -1,5 +1,5 @@
 const express = require('express');
-const { sql, settings, getPool } = require('./db');
+const { sql, getPool } = require('./db');
 const { HttpError, errorHandler } = require('./errors');
 const v = require('./validation');
 const app = express();
@@ -7,12 +7,20 @@ app.disable('x-powered-by');
 app.use(express.json({ limit: '16kb' }));
 
 const roomSelect = `
-  SELECT r.RoomID, r.RoomNumber, r.PricePerNight, r.Status,
+  SELECT r.RoomID, r.RoomNumber, r.PricePerNight, r.Status AS StoredStatus,
+         CASE WHEN EXISTS (
+           SELECT 1 FROM dbo.Bookings b
+           WHERE b.RoomID = r.RoomID
+             AND COALESCE(@OccupancyDate, CONVERT(date, GETDATE())) >= b.CheckInDate
+             AND COALESCE(@OccupancyDate, CONVERT(date, GETDATE())) < DATEADD(day, b.NightsCount, b.CheckInDate)
+         ) THEN 'Occupied' ELSE 'Free' END AS Status,
          r.CategoryID, r.Description, c.CategoryName
   FROM dbo.Rooms r LEFT JOIN dbo.RoomCategories c ON c.CategoryID = r.CategoryID`;
 
 app.get('/api/rooms', async (req, res) => {
-  const result = await (await getPool()).request().query(roomSelect + ' ORDER BY r.RoomID');
+  const occupancyDate = req.query.date === undefined ? null : v.date(req.query.date, 'date');
+  const result = await (await getPool()).request().input('OccupancyDate', sql.Date, occupancyDate)
+    .query(roomSelect + ' ORDER BY r.RoomID');
   res.json(result.recordset);
 });
 
@@ -31,9 +39,26 @@ app.get('/api/rooms/cheaper-than', async (req, res) => {
   res.json(result.recordset);
 });
 
+
+app.get('/api/categories', async (req, res) => {
+  const result = await (await getPool()).request()
+    .query('SELECT CategoryID, CategoryName FROM dbo.RoomCategories ORDER BY CategoryID');
+  res.json(result.recordset);
+});
+
+app.get('/api/rooms/booking-count', async (req, res) => {
+  const roomNumber = v.text(req.query.roomNumber, 'roomNumber', 10);
+  const result = await (await getPool()).request().input('RoomNumber', sql.VarChar(10), roomNumber)
+    .query('SELECT dbo.fn_GetBookingCountByRoom(@RoomNumber) AS BookingCount');
+  res.json({ count: result.recordset[0].BookingCount });
+});
+
+
 app.get('/api/rooms/:id', async (req, res) => {
   const id = v.positiveInt(req.params.id, 'id');
+  const occupancyDate = req.query.date === undefined ? null : v.date(req.query.date, 'date');
   const result = await (await getPool()).request().input('RoomID', sql.Int, id)
+    .input('OccupancyDate', sql.Date, occupancyDate)
     .query(roomSelect + ` WHERE r.RoomID = @RoomID;
       SELECT BookingID, GuestName, RoomID, CheckInDate, NightsCount, TotalPrice
       FROM dbo.Bookings WHERE RoomID = @RoomID ORDER BY BookingID;`);
@@ -58,49 +83,127 @@ app.get('/api/staff', async (req, res) => {
   res.json(result.recordset);
 });
 
-async function testDatabaseOnly(req, res, next) {
-  const same = (a, b) => a.toLowerCase() === b.toLowerCase();
-  if (!settings.enableTestWrites || !settings.testDatabase || !settings.testServer ||
-      same(settings.database, 'HotelDB') || !same(settings.database, settings.testDatabase)) {
-    throw new HttpError(403, 'WRITES_DISABLED', 'Writes require an explicitly approved disposable test database. HotelDB is read-only in this API.');
-  }
 
-  const pool = await getPool();
-  const identity = (await pool.request().query(
-    'SELECT DB_NAME() AS databaseName, CONVERT(nvarchar(128), SERVERPROPERTY(\'ServerName\')) AS serverName'
-  )).recordset[0];
+const input = require('./crud');
 
-  if (!same(identity.databaseName, settings.testDatabase) || same(identity.databaseName, 'HotelDB') ||
-      !same(identity.serverName, settings.testServer)) {
-    throw new HttpError(403, 'TEST_DATABASE_MISMATCH', 'Connected database/server does not match the confirmed disposable test target.');
-  }
-  req.dbPool = pool;
-  next();
+function requireChanged(result) {
+  if (!result.recordset.length) throw new HttpError(404, 'NOT_FOUND', 'Record was not found.');
 }
 
-app.post('/api/staff/cleanup', testDatabaseOnly, async (req, res) => {
-  const revenue = v.amount(v.body(req).minTotalRevenue, 'minTotalRevenue');
-  await req.dbPool.request().input('MinTotalRevenue', sql.Float, revenue)
-    .execute('dbo.usp_DeleteStaffByLowRevenue');
-  res.json({ message: 'Staff cleanup procedure completed.' });
+app.post('/api/rooms', async (req, res) => {
+  const data = v.body(req);
+  const request = input.room(new sql.Request(), data);
+  const pool = await getPool();
+  request.parent = pool;
+  const result = await request.query(`
+    INSERT INTO dbo.Rooms (RoomNumber, PricePerNight, Status, CategoryID, Description)
+    OUTPUT inserted.RoomID
+    VALUES (@RoomNumber, @PricePerNight, @Status, @CategoryID, @Description)`);
+  res.status(201).json({ message: 'Room added.', roomId: result.recordset[0].RoomID });
 });
 
-app.post('/api/bookings', testDatabaseOnly, async (req, res) => {
-  const input = v.body(req);
-  const guest = v.text(input.guestName, 'guestName', 50);
-  const room = v.positiveInt(input.roomId, 'roomId');
-  const checkIn = v.date(input.checkInDate);
-  const nights = v.positiveInt(input.nightsCount, 'nightsCount');
-  const total = v.amount(input.totalPrice, 'totalPrice');
-  
-  await req.dbPool.request()
-    .input('GuestName', sql.VarChar(50), guest).input('RoomID', sql.Int, room)
-    .input('CheckInDate', sql.Date, checkIn).input('NightsCount', sql.Int, nights)
-    .input('TotalPrice', sql.Float, total)
-    .query(`SET DATEFIRST 7;
-      INSERT INTO dbo.Bookings (GuestName, RoomID, CheckInDate, NightsCount, TotalPrice)
-      VALUES (@GuestName, @RoomID, @CheckInDate, @NightsCount, @TotalPrice);`);
-  res.status(201).json({ message: 'Booking submitted successfully.' });
+app.put('/api/rooms/:id', async (req, res) => {
+  const id = v.positiveInt(req.params.id, 'id');
+  const request = input.room(new sql.Request(), v.body(req)).input('ID', sql.Int, id);
+  request.parent = await getPool();
+  const result = await request.query(`
+    UPDATE dbo.Rooms SET RoomNumber=@RoomNumber, PricePerNight=@PricePerNight,
+      Status=@Status, CategoryID=@CategoryID, Description=@Description
+    OUTPUT inserted.RoomID WHERE RoomID=@ID`);
+  requireChanged(result);
+  res.json({ message: 'Room updated.' });
+});
+
+app.delete('/api/rooms/:id', async (req, res) => {
+  const id = v.positiveInt(req.params.id, 'id');
+  const result = await (await getPool()).request().input('ID', sql.Int, id)
+    .query('DELETE FROM dbo.Rooms OUTPUT deleted.RoomID WHERE RoomID=@ID');
+  requireChanged(result);
+  res.json({ message: 'Room deleted.' });
+});
+
+app.post('/api/staff/cleanup', async (req, res) => {
+  const revenue = v.amount(v.body(req).minTotalRevenue, 'minTotalRevenue');
+  await (await getPool()).request().input('MinTotalRevenue', sql.Float, revenue)
+    .execute('dbo.usp_DeleteStaffByLowRevenue');
+  res.json({ message: 'Staff cleanup completed.' });
+});
+
+app.post('/api/staff', async (req, res) => {
+  const request = input.staff(new sql.Request(), v.body(req));
+  request.parent = await getPool();
+  const result = await request.query(`
+    INSERT INTO dbo.Staff (Name, CategoryID, Information) OUTPUT inserted.StaffID
+    VALUES (@Name, @CategoryID, @Information)`);
+  res.status(201).json({ message: 'Employee added.', staffId: result.recordset[0].StaffID });
+});
+
+app.put('/api/staff/:id', async (req, res) => {
+  const id = v.positiveInt(req.params.id, 'id');
+  const request = input.staff(new sql.Request(), v.body(req)).input('ID', sql.Int, id);
+  request.parent = await getPool();
+  const result = await request.query(`
+    UPDATE dbo.Staff SET Name=@Name, CategoryID=@CategoryID, Information=@Information
+    OUTPUT inserted.StaffID WHERE StaffID=@ID`);
+  requireChanged(result);
+  res.json({ message: 'Employee updated.' });
+});
+
+app.delete('/api/staff/:id', async (req, res) => {
+  const id = v.positiveInt(req.params.id, 'id');
+  const result = await (await getPool()).request().input('ID', sql.Int, id)
+    .query('DELETE FROM dbo.Staff OUTPUT deleted.StaffID WHERE StaffID=@ID');
+  requireChanged(result);
+  res.json({ message: 'Employee deleted.' });
+});
+
+app.post('/api/bookings', async (req, res) => {
+  const request = input.booking(new sql.Request(), v.body(req));
+  request.parent = await getPool();
+  await request.query(`SET DATEFIRST 7;
+    INSERT INTO dbo.Bookings (GuestName, RoomID, CheckInDate, NightsCount, TotalPrice)
+    VALUES (@GuestName, @RoomID, @CheckInDate, @NightsCount, @TotalPrice)`);
+  res.status(201).json({ message: 'Booking added.' });
+});
+
+app.put('/api/bookings/:id', async (req, res) => {
+  const id = v.positiveInt(req.params.id, 'id');
+  const request = input.booking(new sql.Request(), v.body(req)).input('ID', sql.Int, id);
+  request.parent = await getPool();
+  const result = await request.query(`
+    DECLARE @updated TABLE (BookingID int);
+    UPDATE dbo.Bookings SET GuestName=@GuestName, RoomID=@RoomID, CheckInDate=@CheckInDate,
+      NightsCount=@NightsCount, TotalPrice=@TotalPrice
+    OUTPUT inserted.BookingID INTO @updated WHERE BookingID=@ID;
+    SELECT BookingID FROM @updated;`);
+  requireChanged(result);
+  res.json({ message: 'Booking updated.' });
+});
+
+app.delete('/api/bookings/:id', async (req, res) => {
+  const id = v.positiveInt(req.params.id, 'id');
+  const result = await (await getPool()).request().input('ID', sql.Int, id)
+    .query('DELETE FROM dbo.Bookings OUTPUT deleted.BookingID WHERE BookingID=@ID');
+  requireChanged(result);
+  res.json({ message: 'Booking deleted.' });
+});
+
+
+app.get('/api/logs/bookings', async (req, res) => {
+  const result = await (await getPool()).request()
+    .query('SELECT Id, BookingID, ModifyDate FROM dbo.BookingLogs ORDER BY ModifyDate DESC, Id DESC');
+  res.json(result.recordset);
+});
+
+app.get('/api/logs/access-denied', async (req, res) => {
+  const result = await (await getPool()).request()
+    .query('SELECT LogID, AttemptDate, Message FROM dbo.AccessDeniedLogs ORDER BY AttemptDate DESC, LogID DESC');
+  res.json(result.recordset);
+});
+
+app.post('/api/error-demo', async (req, res) => {
+  await (await getPool()).request().execute('dbo.usp_DemoBookingError');
+  res.json({ message: 'Procedure completed.' });
 });
 
 app.use((req, res, next) => next(new HttpError(404, 'NOT_FOUND', 'API route was not found.')));
